@@ -1,0 +1,114 @@
+# Compila o raea 0.1.9 para Windows a partir do código-fonte público, numa máquina Windows do GitHub.
+# É o job "windows" do .github/workflows/release.yml oficial (tag v0.1.9), sem: cache em nuvem deles (segredos),
+# "promoção" de binário pronto, atestação, publicação de release e o teste de jogo ao vivo.
+# Tudo fixado: o código no commit exato da v0.1.9 e cada action no hash do commit (não em tag que pode mudar).
+name: build-raea-windows
+
+on:
+  workflow_dispatch:   # só roda quando você clica em "Run workflow"
+
+permissions:
+  contents: read       # só leitura; nada é publicado
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  RAEA_COMMIT: a18b7c757ce62d17a73bf7b28e66507b1a820524   # = tag v0.1.9
+  RAEA_VERSION: 0.1.9
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Código do raea no commit exato da v0.1.9 (com submódulos)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+        with:
+          repository: shinyobjectz/raea
+          ref: ${{ env.RAEA_COMMIT }}
+          submodules: true
+          lfs: false
+          fetch-depth: 0   # release.sh lê o histórico (notas das skills)
+
+      - name: Confere que é o commit certo
+        run: |
+          got=$(git rev-parse HEAD); echo "HEAD = $got"
+          [ "$got" = "$RAEA_COMMIT" ] || { echo "::error::commit diferente"; exit 1; }
+
+      - name: Rust na versão fixada pelo repositório (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: NASM 2.16.03 (zip oficial do nasm.us, como no workflow oficial)
+        run: |
+          v=2.16.03
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/nasm.zip" "https://www.nasm.us/pub/nasm/releasebuilds/$v/win64/nasm-$v-win64.zip"
+          echo "SHA256 do nasm.zip (compare com nasm.us): $(sha256sum "$RUNNER_TEMP/nasm.zip" | cut -d' ' -f1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          unzip -q "$RUNNER_TEMP/nasm.zip" -d "$RUNNER_TEMP"
+          out=$("$RUNNER_TEMP/nasm-$v/nasm.exe" -v); echo "$out"
+          case $out in *"version $v"*) ;; *) echo "::error::NASM errado: $out"; exit 1 ;; esac
+          echo "$RUNNER_TEMP/nasm-$v" >> "$GITHUB_PATH"
+
+      - name: jq que escreve LF (correção do workflow oficial para o Windows)
+        run: |
+          mkdir -p "$RUNNER_TEMP/jq"
+          printf '#!/bin/bash\nexec "%s" -b "$@"\n' "$(command -v jq)" > "$RUNNER_TEMP/jq/jq"
+          chmod +x "$RUNNER_TEMP/jq/jq"
+          echo "$RUNNER_TEMP/jq" >> "$GITHUB_PATH"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6   # v2.2.0
+        with:
+          bun-version: 1.4.2
+
+      - name: Pacotes do runtime (lockfile travado)
+        run: for d in sdk/react/js sdk/react/tw; do (cd "$d" && bun install --frozen-lockfile); done
+
+      - name: Modelo de batida (URL e SHA256 fixados em tools/release/models.tsv)
+        run: |
+          while IFS=$'\t' read -r path url sha; do
+            case $path in ''|'#'*) continue ;; esac
+            mkdir -p "$HOME/.local/share/raea-models/$(dirname "$path")"
+            curl -fsSL "$url" -o "$HOME/.local/share/raea-models/$path"
+            echo "$sha  $HOME/.local/share/raea-models/$path" | sha256sum -c -
+          done < <(tr -d '\r' < tools/release/models.tsv)
+
+      - name: Compilação (a parte longa, 2 a 4 h)
+        run: |
+          feat=$(bash tools/bevy-plugins.sh features sdk/raea/bench/bevy-plugins)
+          t() { s=$SECONDS; "$@"; echo "::notice::$(( (SECONDS - s) / 60 )) min: ${*:7}"; }
+          t cargo build --profile dist --locked -p raea-cli --bin raea --no-default-features --features "$feat"
+          t cargo build --profile dist --locked -p raea-rune-host
+          t cargo build --profile dist --locked -p raea-page-host --features window
+          t cargo build --profile dist --locked -p raea-perceive
+
+      - name: ONNX Runtime da Microsoft (SHA256 fixado no script)
+        run: bash tools/release/onnxruntime.sh target/dist
+
+      - name: Pacote Windows (VC++ runtime, FFmpeg LGPL, uv, DXC, todos com SHA256 fixado)
+        run: bash tools/release/win-bundle.sh target/dist
+
+      - name: Vulkan por software (só nesta máquina, para o teste do pacote; não entra no zip)
+        run: bash tools/release/lavapipe.sh
+
+      - name: Empacota e confere (tools/release.sh oficial)
+        env:
+          RAEA_CHECK_DIR: ${{ runner.temp }}/release-check
+          RAEA_SKILLS_PASSED: ${{ env.RAEA_COMMIT }}   # o mesmo valor que a tag v0.1.9 traz ("skills-passed")
+        run: bash tools/release.sh "$RAEA_VERSION" target/dist HEAD
+
+      - name: Hash do zip gerado
+        run: |
+          ls -la dist/
+          { echo "### SHA256 do zip compilado aqui"; echo '```'; cat dist/raea-*-windows-x86_64.zip.sha256; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        with:
+          name: raea-windows
+          path: |
+            dist/raea-*-windows-x86_64.zip
+            dist/raea-*-windows-x86_64.zip.sha256
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
